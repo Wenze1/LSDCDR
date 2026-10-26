@@ -1,0 +1,20 @@
+data_path: "../data/"
+
+openai_api_key: ""
+openai_base_url: ""
+
+modalities:
+  - name: "sentence"
+    emb_model: "text-embedding-3-large"
+    emb_batch_size: 1024
+    emb_dim: 3072
+    emb_pca: 512
+    enabled: false
+
+only_overlap_users: false
+k_cores: 3
+shuffle_user_sequence: true
+warm_valid_ratio: 0
+warm_test_ratio: 0
+t_cold_valid: 0.1
+t_cold_test: 0.1

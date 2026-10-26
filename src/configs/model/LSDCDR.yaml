@@ -1,0 +1,41 @@
+warm_eval: false
+cold_start_eval: true
+
+training_stages:
+  - name: "target_both"
+    state: "BOTH"
+    epochs: 1000
+    train_batch_size: 2048
+    learner: "adam"
+    learning_rate: 0.001
+    learning_rate_scheduler: [1.0, 50]
+    weight_decay: 0
+
+modalities:
+  - name: "CrossDomain_semantics_both_tag"
+    emb_model: "text-embedding-3-large"
+    emb_batch_size: 1024
+    emb_dim: 3072
+    emb_pca: 3072
+    normalize_semantic_emb: false
+    enabled: true
+
+embedding_dim: 64
+timesteps: 200
+beta_start: 0.0001
+beta_end: 0.5
+beta_sche: "cosine"
+dropout: 0.3
+
+aggregator: "user_attention"
+history_len: 40
+mask_rate: 0.3
+diff_weight: 0.5
+lambda_user_emb: 0.001
+
+top_k_pos: 5
+pseudo_start_epoch: 80
+pseudo_num_per_batch: 16
+pseudo_rec_weight: 0.001
+pseudo_update_interval: 5
+ema_momentum: 0.999
