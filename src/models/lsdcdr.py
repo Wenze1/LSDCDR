@@ -3,483 +3,370 @@ import torch.nn as nn
 import torch.nn.functional as F
 from common.abstract_recommender import GeneralRecommender
 from common.init import xavier_uniform_initialization
-from common.loss import BPRLoss
 import math
 import numpy as np
 from multiprocessing import Pool, cpu_count
 import json
-import os
+
+class CollaborativePrototypeRefiner(nn.Module):
+    """Overlap-supervised residual prototype adjustment, used during training only."""
+
+    def __init__(self, embedding_dim, hidden_dim=None):
+        super().__init__()
+        h = hidden_dim or embedding_dim
+        self.fc1 = nn.Linear(embedding_dim, h)
+        self.fc2 = nn.Linear(h, embedding_dim)
+
+    def reset_residual(self):
+        # Start as an identity mapping: z = x + residual(x).
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, prototype):
+        return prototype + self.fc2(F.relu(self.fc1(prototype)))
 
 
 class LSDCDR(GeneralRecommender):
-    def __init__(self, config, dataloader):
-        super(LSDCDR, self).__init__(config, dataloader)
+    """LSDCDR: diffusion reconstruction + independently supervised prototype refiner.
 
+    Objective:
+      * diff_tgt: reconstruct *target item embeddings* for observed overlap pairs
+        and pseudo target pairs of source-only users (no BPR or ranking loss).
+      * prototype_refiner: sampled-softmax on real overlap target interactions;
+        its inputs are stop-gradient EMA diffusion prototypes, with target item
+        embeddings detached in this auxiliary objective.
+      * Refiner affects diffusion solely by rebuilding pseudo target pairs.
+      * Inference: ONLINE diffusion only; never uses prototype_refiner or EMA.
+
+    Trainer contract: calculate_loss() returns ONE scalar so existing optimizers
+    can step the diffusion/encoder and refiner parameters jointly; their graphs
+    are independent. post_batch_processing() MUST be invoked AFTER optimizer.step()
+    to update EMA and, when due, refresh pseudo interactions.
+    """
+
+    def __init__(self, config, dataloader):
+        super().__init__(config, dataloader)
         self.config = config
-        self.embedding_dim = config["embedding_dim"]
-        self.diff_weight = config["diff_weight"]
-        self.bpr_loss = BPRLoss()
+        self.embedding_dim = int(config['embedding_dim'])
+        self.diff_weight = float(config.get('diff_weight', 1.0))
+        self.pseudo_diff_weight = float(config.get('pseudo_diff_weight', 1.0))
+        self.refiner_weight = float(config.get('refiner_weight', 1.0))
+        self.refiner_temperature = float(config.get('refiner_temperature', 0.2))
+        self.refiner_num_neg = int(config.get('refiner_num_neg', 32))
+        self.refiner_train_interval = int(config.get('refiner_train_interval', 1))
+        self.pseudo_start_epoch = int(config.get('pseudo_start_epoch', 0))
+        self.refiner_start_epoch = int(config.get('refiner_start_epoch', self.pseudo_start_epoch))
+        self.pseudo_update_interval = int(config.get('pseudo_update_interval', 0))
+        self.pseudo_generation_batch_size = int(config.get('pseudo_generation_batch_size', 512))
+        # Direct, causally clean ablations (w/o IR, w/o CR, w/o EMA).
+        self.use_iterative_refinement = bool(config.get('use_iterative_refinement', True))
+        self.use_collaborative_refiner = bool(config.get('use_collaborative_refiner', True))
+        self.use_ema_for_prototypes = bool(config.get('use_ema_for_prototypes', True))
+        if self.refiner_temperature <= 0 or self.refiner_num_neg <= 0:
+            raise ValueError('refiner_temperature and refiner_num_neg must be > 0')
+        if self.refiner_train_interval <= 0:
+            raise ValueError('refiner_train_interval must be > 0')
 
         self.emb_user = nn.Embedding(
             self.num_users_src + self.num_users_tgt - self.num_users_overlap + 1,
-            self.embedding_dim,
-            padding_idx=0,
+            self.embedding_dim, padding_idx=0
         )
-        self.emb_item_src = nn.Embedding(
-            self.num_items_src + 1, self.embedding_dim, padding_idx=0
-        )
-        self.emb_item_tgt = nn.Embedding(
-            self.num_items_tgt + 1, self.embedding_dim, padding_idx=0
-        )
+        self.emb_item_src = nn.Embedding(self.num_items_src + 1,
+                                         self.embedding_dim, padding_idx=0)
+        self.emb_item_tgt = nn.Embedding(self.num_items_tgt + 1,
+                                         self.embedding_dim, padding_idx=0)
 
-        semantic_emb = dataloader.get_modality_embs()["CrossDomain_semantics_both_tag"]
-        semantic_emb = torch.from_numpy(semantic_emb).float()  # [U + Is + It, D]
-
+        # Existing, offline LLM + semantic retrieval initialization is unchanged.
+        semantic_emb = torch.from_numpy(
+            dataloader.get_modality_embs()['CrossDomain_semantics_both_tag']
+        ).float()
         num_users = self.num_users_src + self.num_users_tgt - self.num_users_overlap
-        num_src_items = self.num_items_src
-        num_tgt_items = self.num_items_tgt
-        assert (
-            semantic_emb.shape[0] == num_users + num_src_items + num_tgt_items
-        ), "Semantic embedding size mismatch."
-
-        user_semantic_emb = semantic_emb[:num_users]
-        src_item_semantic_emb = semantic_emb[num_users : num_users + num_src_items]
-        tgt_item_semantic_emb = semantic_emb[num_users + num_src_items :]
-        pad_user = torch.zeros(1, user_semantic_emb.shape[1])
-        pad_src_item = torch.zeros(1, src_item_semantic_emb.shape[1])
-        pad_tgt_item = torch.zeros(1, tgt_item_semantic_emb.shape[1])
-        user_semantic_emb = torch.cat([pad_user, user_semantic_emb], dim=0)
-        src_item_semantic_emb = torch.cat([pad_src_item, src_item_semantic_emb], dim=0)
-        tgt_item_semantic_emb = torch.cat([pad_tgt_item, tgt_item_semantic_emb], dim=0)
-
-        self.register_buffer("user_text_emb", user_semantic_emb)
-        self.register_buffer("src_item_text_emb", src_item_semantic_emb)
-        self.register_buffer("tgt_item_text_emb", tgt_item_semantic_emb)
+        assert semantic_emb.shape[0] == num_users + self.num_items_src + self.num_items_tgt, \
+            'Semantic embedding size mismatch.'
+        user_sem = semantic_emb[:num_users]
+        src_item_sem = semantic_emb[num_users:num_users + self.num_items_src]
+        tgt_item_sem = semantic_emb[num_users + self.num_items_src:]
+        for name, embeddings in (
+            ('user_text_emb', user_sem),
+            ('src_item_text_emb', src_item_sem),
+            ('tgt_item_text_emb', tgt_item_sem),
+        ):
+            self.register_buffer(name, torch.cat([torch.zeros_like(embeddings[:1]), embeddings], dim=0))
 
         self.src_only_pseudo_pos = self._build_src_only_pseudo_positives()
+        self.pseudo_ui_pairs = [
+            (u, item) for u, items in self.src_only_pseudo_pos.items()
+            for item in sorted(items)
+        ]
 
-        self.pseudo_ui_pairs = []
-        for u, items in self.src_only_pseudo_pos.items():
-            for i in items:
-                self.pseudo_ui_pairs.append((u, i))
-
-        self.diff_src = Diffusion(config)
+        # Only one (target-domain) online diffusion model is needed.
         self.diff_tgt = Diffusion(config)
-
-        # EMA
-        self.diff_tgt_ema = None
-        self.ema_initialized = False
-        self.global_step = 0
-
         self.src_interaction_agg = InteractionAggregator(config)
-        self.tgt_interaction_agg = InteractionAggregator(config)
+        self.prototype_refiner = CollaborativePrototypeRefiner(
+            self.embedding_dim, config.get('refiner_hidden_dim', self.embedding_dim)
+        )
 
-        (
-            self.history_src_user_src,
-            self.history_src_user_tgt,
-            self.history_tgt_user_src,
-            self.history_tgt_user_tgt,
-        ) = self._build_padded_history(dataloader)
+        (self.history_src_user_src,
+         self.history_src_user_tgt,
+         self.history_tgt_user_src,
+         self.history_tgt_user_tgt) = self._build_padded_history(dataloader)
+        # Never use target-domain histories as a diffusion condition:
+        # test/cold users must have ZERO target observations in training.
+        self.overlap_target_positives = {
+            int(u): set(map(int, items))
+            for u, items in dataloader.dataset.positive_items_tgt.items()
+            if 1 <= int(u) <= self.num_users_overlap
+        }
 
         self.apply(xavier_uniform_initialization)
-        self.emb_user.weight.data[0, :] = 0
-        self.emb_item_src.weight.data[0, :] = 0
-        self.emb_item_tgt.weight.data[0, :] = 0
+        with torch.no_grad():
+            self.emb_user.weight[0].zero_()
+            self.emb_item_src.weight[0].zero_()
+            self.emb_item_tgt.weight[0].zero_()
+        self.prototype_refiner.reset_residual()
+
+        # Optional use of externally pretrained target item embeddings.
+        # Set True ONLY if actual pretrained weights are subsequently loaded.
+        if config.get('freeze_tgt_item_embeddings', False):
+            self.emb_item_tgt.weight.requires_grad_(False)
+
+        # EMA must exist before training: prototype refiner uses it from epoch 0.
+        import copy
+        self.diff_tgt_ema = copy.deepcopy(self.diff_tgt)
+        self.diff_tgt_ema.requires_grad_(False)
+        self.diff_tgt_ema.eval()
+        self.ema_initialized = True
+        self.global_step = 0
+        self.pseudo_refinement_count = 0
+        self.last_loss_breakdown = {}
 
     @torch.no_grad()
     def _build_src_only_pseudo_positives(self):
-        top_k = self.config["top_k_pos"]
-
-        pseudo_pos = {}
-
-        u_start = self.num_users_overlap + 1
-        u_end = self.num_users_src + 1
-        user_emb = self.user_text_emb[u_start:u_end]  # [U_s, D]
-
-        item_emb = self.tgt_item_text_emb[1:]  # [I_t, D]
-
-        # user_emb = F.normalize(user_emb, dim=1)
-        # item_emb = F.normalize(item_emb, dim=1)
-        sim = torch.matmul(user_emb, item_emb.T)  # [U_s, I_t]
-
-        # 4. Top-K
-        topk_vals, topk_idx = torch.topk(sim, k=top_k, dim=1)
-
-        for i, u_global in enumerate(range(u_start, u_end)):
-            pseudo_items = (topk_idx[i] + 1).tolist()
-            pseudo_pos[u_global] = set(pseudo_items)
-
-        return pseudo_pos
+        top_k = min(int(self.config['top_k_pos']), self.num_items_tgt)
+        if top_k <= 0:
+            raise ValueError('top_k_pos must be positive')
+        start, end = self.num_users_overlap + 1, self.num_users_src + 1
+        user_emb = self.user_text_emb[start:end]
+        item_emb = self.tgt_item_text_emb[1:]
+        if not user_emb.numel():
+            return {}
+        topk_idx = (user_emb @ item_emb.T).topk(k=top_k, dim=1).indices + 1
+        return {uid: set(row.tolist()) for uid, row in zip(range(start, end), topk_idx)}
 
     def _build_padded_history(self, dataloader):
-        L = int(self.config["history_len"])
-
-        # ---------- src user space ----------
-        history_src_user_src = torch.zeros(
-            (self.num_users_src + 1, L), dtype=torch.long, device=self.device
-        )
-        history_src_user_tgt = torch.zeros(
-            (self.num_users_src + 1, L), dtype=torch.long, device=self.device
-        )
-
-        # ---------- tgt user space ----------
-        history_tgt_user_src = torch.zeros(
-            (self.num_users_tgt + 1, L), dtype=torch.long, device=self.device
-        )
-        history_tgt_user_tgt = torch.zeros(
-            (self.num_users_tgt + 1, L), dtype=torch.long, device=self.device
-        )
-
-        # ===== src domain interactions =====
+        L = int(self.config['history_len'])
+        h_ss = torch.zeros((self.num_users_src + 1, L), dtype=torch.long, device=self.device)
+        h_st = torch.zeros((self.num_users_src + 1, L), dtype=torch.long, device=self.device)
+        h_ts = torch.zeros((self.num_users_tgt + 1, L), dtype=torch.long, device=self.device)
+        h_tt = torch.zeros((self.num_users_tgt + 1, L), dtype=torch.long, device=self.device)
         for u, items in dataloader.dataset.positive_items_src.items():
-            if not items:
-                continue
-            items = list(items)[-L:]
-            history_src_user_src[u, : len(items)] = torch.tensor(
-                items, device=self.device
-            )
-
-            # overlap users: also visible in tgt-user space
-            if u <= self.num_users_overlap:
-                history_tgt_user_src[u, : len(items)] = torch.tensor(
-                    items, device=self.device
-                )
-
-        # ===== tgt domain interactions =====
+            ids = list(items)[-L:]
+            if ids:
+                h_ss[u, :len(ids)] = torch.as_tensor(ids, dtype=torch.long, device=self.device)
+                if u <= self.num_users_overlap:
+                    h_ts[u, :len(ids)] = h_ss[u, :len(ids)]
         for u, items in dataloader.dataset.positive_items_tgt.items():
-            if not items:
-                continue
-            items = list(items)[-L:]
-            history_tgt_user_tgt[u, : len(items)] = torch.tensor(
-                items, device=self.device
-            )
+            ids = list(items)[-L:]
+            if ids:
+                h_tt[u, :len(ids)] = torch.as_tensor(ids, dtype=torch.long, device=self.device)
+                if u <= self.num_users_overlap:
+                    h_st[u, :len(ids)] = h_tt[u, :len(ids)]
+        return h_ss, h_st, h_ts, h_tt
 
-            # overlap users: also visible in src-user space
-            if u <= self.num_users_overlap:
-                history_src_user_tgt[u, : len(items)] = torch.tensor(
-                    items, device=self.device
-                )
-
-        return (
-            history_src_user_src,
-            history_src_user_tgt,
-            history_tgt_user_src,
-            history_tgt_user_tgt,
-        )
-
-    def batch_random_mask(self, seq: torch.Tensor, mask_rate: float, min_keep: int = 1):
-        """
-        seq: [B, L] item ids, 0 is padding
-        return: masked_seq [B, L] with some non-zero positions set to 0
-        """
-
+    @staticmethod
+    def batch_random_mask(seq, mask_rate, min_keep=1):
         if mask_rate <= 0:
             return seq
-
-        # valid positions
-        valid = seq != 0  # [B, L]
-        valid_cnt = valid.sum(dim=1)  # [B]
-
-        # keep at least min_keep (and at least 1 if you want)
-        keep_cnt = (valid_cnt.float() * (1 - mask_rate)).long()
-        keep_cnt = torch.clamp(keep_cnt, min=min_keep)
-        # also cannot exceed valid_cnt
-        keep_cnt = torch.minimum(keep_cnt, valid_cnt)
-
-        # random score per position, invalid positions get large so they go to the end
-        rand = torch.rand_like(seq.float())  # [B, L]
-        rand = rand.masked_fill(~valid, 2.0)
-
-        # smaller rand = kept (top-k smallest)
-        order = rand.argsort(dim=1)  # [B, L]
-        B, L = seq.shape
-        pos = torch.arange(L, device=seq.device).unsqueeze(0).expand(B, L)
-        keep_mask_in_order = pos < keep_cnt.unsqueeze(1)  # [B, L]
-
+        valid = seq != 0
+        cnt = valid.sum(dim=1)
+        keep = ((1.0 - mask_rate) * cnt.float()).long().clamp(min=min_keep)
+        keep = torch.minimum(keep, cnt)
+        rand = torch.rand(seq.shape, device=seq.device).masked_fill(~valid, 2.0)
+        order = rand.argsort(dim=1)
+        mask_order = (torch.arange(seq.size(1), device=seq.device)[None, :] < keep[:, None])
         keep_mask = torch.zeros_like(valid)
-        keep_mask.scatter_(1, order, keep_mask_in_order)  # [B, L] True means keep
+        keep_mask.scatter_(1, order, mask_order)
+        return seq.masked_fill(~keep_mask, 0)
 
-        out = seq.clone()
-        out[~keep_mask] = 0
+    def _src_condition(self, global_users, src_histories, training_mask=False):
+        if training_mask:
+            src_histories = self.batch_random_mask(
+                src_histories, float(self.config.get('mask_rate', 0.0)))
+        src_item_emb = self.emb_item_src(src_histories)
+        query = self.emb_user(global_users)
+        return self.src_interaction_agg(src_item_emb, query)
+
+    def _target_reconstruction(self, users, pos_items, src_histories):
+        """Diffusion reconstructs target ITEM embedding, not user ID embedding."""
+        cond = self._src_condition(users, src_histories, training_mask=True)
+        x0 = self.emb_item_tgt(pos_items)
+        t = torch.randint(self.diff_tgt.timesteps, (len(users),), device=users.device)
+        loss, _ = self.diff_tgt.p_losses(
+            x_start=x0, t=t, cond_src=cond,
+            cond_tgt=torch.zeros_like(cond), loss_type='l2')
+        return loss
+
+    @torch.no_grad()
+    def _ema_prototypes(self, global_users, src_histories):
+        """Identical deterministic inference path for overlap and cold users."""
+        prev_training = self.src_interaction_agg.training
+        self.src_interaction_agg.eval()
+        try:
+            cond = self._src_condition(global_users, src_histories, training_mask=False)
+        finally:
+            self.src_interaction_agg.train(prev_training)
+        teacher = self.diff_tgt_ema if self.use_ema_for_prototypes else self.diff_tgt
+        teacher_was_training = teacher.training
+        teacher.eval()
+        try:
+            return teacher.sample_from_noise(
+                cond_src=cond, cond_tgt=torch.zeros_like(cond))
+        finally:
+            teacher.train(teacher_was_training)
+
+    def _refiner_negatives(self, users, pos_items):
+        """Uniform sampled negatives, excluding each overlap user's known positives."""
+        B, n = len(users), self.refiner_num_neg
+        out = torch.empty((B, n), dtype=torch.long, device=users.device)
+        for row, (uid, pos) in enumerate(zip(users.tolist(), pos_items.tolist())):
+            forbidden = self.overlap_target_positives.get(uid, set()) | {pos}
+            if len(forbidden) >= self.num_items_tgt:
+                raise ValueError(f'No available negative target items for overlap user {uid}')
+            sampled = []
+            while len(sampled) < n:
+                candidate = torch.randint(1, self.num_items_tgt + 1,
+                                          (max(2 * (n - len(sampled)), 8),),
+                                          device=users.device).tolist()
+                sampled.extend(x for x in candidate if x not in forbidden)
+            out[row] = torch.tensor(sampled[:n], dtype=torch.long, device=users.device)
         return out
 
-    def sample_tgt_neg_excluding_pseudo(self, users, num_items_tgt, max_retry=5):
-        neg_items = []
-        users_list = users.tolist()
+    def _refiner_softmax_loss(self, overlap_users, pos_items):
+        """Only refiner parameters receive gradients from this loss."""
+        # EMA model and source/history encoder both frozen in this branch.
+        with torch.no_grad():
+            hist = self.history_src_user_src[overlap_users]
+            proto = self._ema_prototypes(overlap_users, hist)
+            negatives = self._refiner_negatives(overlap_users, pos_items)
+            positive_emb = self.emb_item_tgt(pos_items).detach()
+            negative_emb = self.emb_item_tgt(negatives).detach()
 
-        for u in users_list:
-            forbid = self.src_only_pseudo_pos.get(u, None)
-
-            neg = None
-            for _ in range(max_retry):
-                cand = torch.randint(
-                    low=1, high=num_items_tgt + 1, size=(1,), device=self.device
-                ).item()
-                if cand not in forbid:
-                    neg = cand
-                    break
-
-            if neg is None:
-                neg = cand
-            neg_items.append(neg)
-
-        return torch.tensor(neg_items, device=self.device)
+        refined = self.prototype_refiner(proto.detach())
+        pos_logits = (refined * positive_emb).sum(dim=-1, keepdim=True)
+        neg_logits = (refined.unsqueeze(1) * negative_emb).sum(dim=-1)
+        logits = torch.cat([pos_logits, neg_logits], dim=1) / self.refiner_temperature
+        # First candidate is always the real target-domain positive.
+        return F.cross_entropy(logits, torch.zeros(len(overlap_users),
+                                                  dtype=torch.long, device=overlap_users.device))
 
     def pre_epoch_processing(self, epoch_idx):
-
-        if epoch_idx >= self.config["pseudo_start_epoch"]:
-            if not self.ema_initialized:
-                import copy
-
-                self.diff_tgt_ema = copy.deepcopy(self.diff_tgt)
-                for p in self.diff_tgt_ema.parameters():
-                    p.requires_grad = False
-                self.ema_initialized = True
-
-    def post_batch_processing(self, epoch_idx, batch_idx):
-
-        if epoch_idx >= self.config["pseudo_start_epoch"]:
-            self._momentum_update()
-            self.global_step += 1
+        # Kept for existing trainer hooks. EMA is already initialized in __init__.
+        self.current_epoch = epoch_idx
 
     @torch.no_grad()
     def _momentum_update(self):
-
-        if self.diff_tgt_ema is None:
-            return
-        m = self.config["ema_momentum"]
+        m = float(self.config.get('ema_momentum', 0.999))
         for p, p_ema in zip(self.diff_tgt.parameters(), self.diff_tgt_ema.parameters()):
-            p_ema.data.mul_(m).add_(p.data, alpha=1 - m)
+            p_ema.lerp_(p, 1.0 - m)
+
+    def post_batch_processing(self, epoch_idx, batch_idx):
+        """CALL THIS ONLY AFTER optimizer.step(). Never update EMA in forward."""
+        if self.use_ema_for_prototypes:
+            self._momentum_update()
+        self.global_step += 1
+        if (self.use_iterative_refinement
+                and epoch_idx >= self.pseudo_start_epoch and self.pseudo_update_interval > 0
+                and self.global_step % self.pseudo_update_interval == 0):
+            self.rebuild_src_only_pseudo_with_ema()
 
     @torch.no_grad()
     def rebuild_src_only_pseudo_with_ema(self):
-        assert self.diff_tgt_ema is not None
-
-        top_k = self.config["top_k_pos"]
-        batch_size = 2048
-
-        u_start = self.num_users_overlap + 1
-        u_end = self.num_users_src + 1
-
-        item_emb = self.emb_item_tgt.weight[1:]  # [I_t, D]
-
-        new_pseudo_pos = {}
+        """EMA prototype -> collaborative refiner -> full-catalog Top-K update."""
+        top_k = min(int(self.config['top_k_pos']), self.num_items_tgt)
+        start, end = self.num_users_overlap + 1, self.num_users_src + 1
         new_pairs = []
-        for s in range(u_start, u_end, batch_size):
-            e = min(s + batch_size, u_end)
-            users = torch.arange(s, e, device=self.device)
-
-            u = self.emb_user(users)
-
-            hist_src_items = self.history_src_user_src[users]
-            hist_tgt_items = self.history_src_user_tgt[users]
-            hist_src = self.emb_item_src(hist_src_items)
-            hist_tgt = self.emb_item_tgt(hist_tgt_items)
-            cond_src = self.src_interaction_agg(hist_src, u)
-            cond_tgt = self.tgt_interaction_agg(hist_tgt, u)
-
-            t = torch.zeros(users.size(0), dtype=torch.long, device=self.device)
-
-            _, u_denoised = self.diff_tgt_ema.p_losses(
-                x_start=u, t=t, cond_src=cond_src, cond_tgt=cond_tgt, loss_type="l2"
-            )
-
-            u_final = u + self.config["lambda_user_emb"] * u_denoised
-
-            sim = torch.matmul(u_final, item_emb.T)
-            topk_idx = torch.topk(sim, k=top_k, dim=1).indices + 1
-
-            for i, uid in enumerate(range(s, e)):
-                items = set(topk_idx[i].tolist())
-                new_pseudo_pos[uid] = items
-                for it in items:
-                    new_pairs.append((uid, it))
-
-        self.src_only_pseudo_pos = new_pseudo_pos
+        new_pos = {}
+        self.prototype_refiner.eval()
+        target_emb = self.emb_item_tgt.weight[1:].detach()
+        try:
+            for s in range(start, end, self.pseudo_generation_batch_size):
+                e = min(s + self.pseudo_generation_batch_size, end)
+                users = torch.arange(s, e, device=self.emb_user.weight.device)
+                hist = self.history_src_user_src[users]
+                proto = self._ema_prototypes(users, hist)
+                adjusted = self.prototype_refiner(proto) if self.use_collaborative_refiner else proto
+                idx = (adjusted @ target_emb.T).topk(k=top_k, dim=1).indices + 1
+                for uid, item_row in zip(users.tolist(), idx.tolist()):
+                    new_pos[uid] = set(item_row)
+                    new_pairs.extend((uid, it) for it in item_row)
+        finally:
+            self.prototype_refiner.train(self.training)
+        self.src_only_pseudo_pos = new_pos
         self.pseudo_ui_pairs = new_pairs
+        self.pseudo_refinement_count += 1
 
     def calculate_loss(self, interaction, epoch_idx):
+        # Real overlap target pairs: exclude target-only users; no held-out pairs
+        # may appear in interaction['pos_items_tgt'] (enforced upstream).
+        users_tgt = interaction['users_tgt'].long()
+        pos_tgt = interaction['pos_items_tgt'].long()
+        overlap_mask = (users_tgt > 0) & (users_tgt <= self.num_users_overlap)
+        overlap_users = users_tgt[overlap_mask]
+        overlap_pos = pos_tgt[overlap_mask]
 
-        use_pseudo = epoch_idx >= self.config["pseudo_start_epoch"]
+        zero = self.emb_user.weight.sum() * 0.0
+        loss_real = zero
+        if overlap_users.numel():
+            loss_real = self._target_reconstruction(
+                overlap_users, overlap_pos, self.history_src_user_src[overlap_users])
 
-        if (
-            epoch_idx >= self.config["pseudo_start_epoch"]
-            and self.diff_tgt_ema is not None
-            and self.global_step > 0
-            and self.global_step % self.config["pseudo_update_interval"] == 0
-        ):
-            self.rebuild_src_only_pseudo_with_ema()
+        loss_pseudo = zero
+        if epoch_idx >= self.pseudo_start_epoch and self.pseudo_ui_pairs:
+            B = int(self.config.get('pseudo_num_per_batch', len(overlap_users) or 1))
+            if B > 0:
+                indices = torch.randint(len(self.pseudo_ui_pairs), (B,), device=self.device)
+                pairs = [self.pseudo_ui_pairs[j] for j in indices.tolist()]
+                pseudo_u = torch.tensor([u for u, _ in pairs], device=self.device)
+                pseudo_i = torch.tensor([i for _, i in pairs], device=self.device)
+                loss_pseudo = self._target_reconstruction(
+                    pseudo_u, pseudo_i, self.history_src_user_src[pseudo_u])
 
-        users_src = interaction["users_src"]
-        pos_items_src = interaction["pos_items_src"]
-        neg_items_src = interaction["neg_items_src"]
-        users_tgt = interaction["users_tgt"]
-        pos_items_tgt = interaction["pos_items_tgt"]
-        neg_items_tgt = interaction["neg_items_tgt"]
+        loss_ref = zero
+        if (epoch_idx >= self.refiner_start_epoch
+                and self.use_iterative_refinement and self.use_collaborative_refiner
+                and overlap_users.numel() and self.global_step % self.refiner_train_interval == 0):
+            loss_ref = self._refiner_softmax_loss(overlap_users, overlap_pos)
 
-        u_src = self.emb_user(users_src)  # [B, D]
-        i_pos_src = self.emb_item_src(pos_items_src)  # [B, D]
-        i_neg_src = self.emb_item_src(neg_items_src)  # [B, D]
+        # Disjoint gradient pathways:
+        #   Diffusion/conditions/items <- loss_real + loss_pseudo
+        #   prototype_refiner         <- loss_ref ONLY
+        # Refiner -> Diffusion influence occurs exclusively via pseudo-label updates.
+        total = (self.diff_weight * (loss_real + self.pseudo_diff_weight * loss_pseudo)
+                 + self.refiner_weight * loss_ref)
+        self.last_loss_breakdown = {
+            'diff_real': float(loss_real.detach()),
+            'diff_pseudo': float(loss_pseudo.detach()),
+            'refiner_softmax': float(loss_ref.detach()),
+        }
+        return total
 
-        hist_src_items = self.history_src_user_src[users_src]  # [B, L]
-        hist_tgt_items = self.history_src_user_tgt[users_src]  # [B, L]
-        hist_src_items = self.batch_random_mask(
-            hist_src_items, self.config["mask_rate"], min_keep=1
-        )
-        hist_tgt_items = self.batch_random_mask(
-            hist_tgt_items, self.config["mask_rate"], min_keep=1
-        )
-        hist_src = self.emb_item_src(hist_src_items)  # [B, L, D]
-        hist_tgt = self.emb_item_tgt(hist_tgt_items)  # [B, L, D]
-        cond_src = self.src_interaction_agg(hist_src, u_src)
-        cond_tgt = self.tgt_interaction_agg(hist_tgt, u_src)
-
-        B = u_src.size(0)
-        t_src = torch.randint(
-            low=0, high=self.diff_src.timesteps, size=(B,), device=u_src.device
-        )
-        diff_loss_src, u_src_denoised = self.diff_src.p_losses(
-            x_start=u_src, t=t_src, cond_src=cond_src, cond_tgt=cond_tgt, loss_type="l2"
-        )
-        u_src_final = u_src + self.config["lambda_user_emb"] * u_src_denoised
-
-        pos_score_src = (u_src_final * i_pos_src).sum(dim=-1)
-        neg_score_src = (u_src_final * i_neg_src).sum(dim=-1)
-        bpr_loss_src = self.bpr_loss(pos_score_src, neg_score_src)
-
-        users_tgt_local = users_tgt
-        offset = self.num_users_src - self.num_users_overlap
-        users_tgt_global = (
-            users_tgt_local + (users_tgt_local > self.num_users_overlap).long() * offset
-        )
-        u_tgt = self.emb_user(users_tgt_global)  # [B, D]
-        i_pos_tgt = self.emb_item_tgt(pos_items_tgt)  # [B, D]
-        i_neg_tgt = self.emb_item_tgt(neg_items_tgt)  # [B, D]
-
-        hist_src_items = self.history_tgt_user_src[users_tgt]  # [B, L]
-        hist_tgt_items = self.history_tgt_user_tgt[users_tgt]  # [B, L]
-        hist_src_items = self.batch_random_mask(
-            hist_src_items, self.config["mask_rate"], min_keep=1
-        )
-        hist_tgt_items = self.batch_random_mask(
-            hist_tgt_items, self.config["mask_rate"], min_keep=1
-        )
-        hist_src = self.emb_item_src(hist_src_items)
-        hist_tgt = self.emb_item_tgt(hist_tgt_items)
-        cond_src = self.src_interaction_agg(hist_src, u_tgt)
-        cond_tgt = self.tgt_interaction_agg(hist_tgt, u_tgt)
-
-        B = u_tgt.size(0)
-        t_tgt = torch.randint(
-            low=0, high=self.diff_tgt.timesteps, size=(B,), device=u_tgt.device
-        )
-        diff_loss_tgt, u_tgt_denoised = self.diff_tgt.p_losses(
-            x_start=u_tgt, t=t_tgt, cond_src=cond_src, cond_tgt=cond_tgt, loss_type="l2"
-        )
-        u_tgt_final = u_tgt + self.config["lambda_user_emb"] * u_tgt_denoised
-
-        pos_score_tgt = (u_tgt_final * i_pos_tgt).sum(dim=-1)
-        neg_score_tgt = (u_tgt_final * i_neg_tgt).sum(dim=-1)
-        bpr_loss_tgt = self.bpr_loss(pos_score_tgt, neg_score_tgt)
-
-        pseudo_loss = 0.0
-        if use_pseudo:
-            num_pseudo = self.config["pseudo_num_per_batch"]
-
-            idx = torch.randint(
-                low=0,
-                high=len(self.pseudo_ui_pairs),
-                size=(num_pseudo,),
-                device=self.device,
-            )
-            u_list = []
-            i_list = []
-            for j in idx.tolist():
-                u, i = self.pseudo_ui_pairs[j]
-                u_list.append(u)
-                i_list.append(i)
-            pseudo_users = torch.tensor(u_list, device=self.device)
-            pseudo_items = torch.tensor(i_list, device=self.device)
-
-            neg_items = self.sample_tgt_neg_excluding_pseudo(
-                pseudo_users, self.num_items_tgt
-            )
-
-            u_pseudo = self.emb_user(pseudo_users)
-
-            hist_src_items = self.history_src_user_src[pseudo_users]  # [Bp, L]
-            hist_tgt_items = self.history_src_user_tgt[pseudo_users]  # [Bp, L]
-            hist_src_items = self.batch_random_mask(
-                hist_src_items, self.config["mask_rate"], min_keep=1
-            )
-            hist_tgt_items = self.batch_random_mask(
-                hist_tgt_items, self.config["mask_rate"], min_keep=1
-            )
-            hist_src = self.emb_item_src(hist_src_items)  # [Bp, L, D]
-            hist_tgt = self.emb_item_tgt(hist_tgt_items)  # [Bp, L, D]
-            cond_src = self.src_interaction_agg(hist_src, u_pseudo)  # [Bp, D]
-            cond_tgt = self.tgt_interaction_agg(hist_tgt, u_pseudo)  # [Bp, D]
-            Bp = u_pseudo.size(0)
-            t_pseudo = torch.randint(
-                low=0, high=self.diff_tgt.timesteps, size=(Bp,), device=u_pseudo.device
-            )
-            diff_loss_pseudo, u_pseudo_denoised = self.diff_tgt.p_losses(
-                x_start=u_pseudo,
-                t=t_pseudo,
-                cond_src=cond_src,
-                cond_tgt=cond_tgt,
-                loss_type="l2",
-            )
-            u_pseudo_final = (
-                u_pseudo + self.config["lambda_user_emb"] * u_pseudo_denoised
-            )
-
-            i_emb = self.emb_item_tgt(pseudo_items)  # [Bp, D]
-            neg_emb = self.emb_item_tgt(neg_items)
-
-            pos_score = (u_pseudo_final * i_emb).sum(dim=-1)
-            neg_score = (u_pseudo_final * neg_emb).sum(dim=-1)
-            pseudo_loss = self.bpr_loss(pos_score, neg_score)
-
-        # loss = loss_rec + loss_dif + loss_pseudo
-        loss = (
-            bpr_loss_src
-            + bpr_loss_tgt
-            + self.diff_weight * (diff_loss_src + diff_loss_tgt)
-        )
-        if use_pseudo:
-            loss = loss + self.config["pseudo_rec_weight"] * pseudo_loss
-        return loss
-
+    @torch.no_grad()
     def full_sort_predict(self, interaction, is_warm):
-        users = interaction[0].long()  # [B]
-        device = users.device
-
+        users = interaction[0].long()
         if is_warm:
-
+            # Target user IDs of overlap users coincide with source user IDs.
+            # Target-only users have no observed source history.
             offset = self.num_users_src - self.num_users_overlap
-            users_global = users + (users > self.num_users_overlap).long() * offset
-            u = self.emb_user(users_global)
-
-            hist_src = self.emb_item_src(self.history_tgt_user_src[users])  # [B, L, D]
-            hist_tgt = self.emb_item_tgt(self.history_tgt_user_tgt[users])  # [B, L, D]
+            global_users = users + (users > self.num_users_overlap).long() * offset
+            histories = self.history_tgt_user_src[users]
         else:
-            u = self.emb_user(users)
-
-            hist_src = self.emb_item_src(self.history_src_user_src[users])  # [B, L, D]
-            hist_tgt = self.emb_item_tgt(self.history_src_user_tgt[users])  # [B, L, D]
-
-        cond_src = self.src_interaction_agg(hist_src, u)
-        cond_tgt = self.tgt_interaction_agg(hist_tgt, u)
-        _, u_denoised, _, _, _ = self.diff_tgt.sample(
-            x_start=u, cond_src=cond_src, cond_tgt=cond_tgt
-        )
-
-        u_final = u + self.config["lambda_user_emb"] * u_denoised
-
-        item_emb = self.emb_item_tgt.weight
-        scores = torch.matmul(u_final, item_emb.t())
-        scores[:, 0] = 0.0
+            global_users = users
+            histories = self.history_src_user_src[users]
+        cond = self._src_condition(global_users, histories, training_mask=False)
+        prototype = self.diff_tgt.sample_from_noise(
+            cond_src=cond, cond_tgt=torch.zeros_like(cond))
+        scores = prototype @ self.emb_item_tgt.weight.T
+        scores[:, 0] = -1e9
         return scores
 
 
@@ -499,7 +386,7 @@ def cosine_beta_schedule(timesteps, s=0.008):
 def exp_beta_schedule(timesteps, beta_min=0.1, beta_max=10):
     x = torch.linspace(1, 2 * timesteps + 1, timesteps)
     betas = 1 - torch.exp(
-        -beta_min / timesteps
+        - beta_min / timesteps
         - x * 0.5 * (beta_max - beta_min) / (timesteps * timesteps)
     )
     return betas
@@ -531,23 +418,22 @@ def init(m):
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
 
-
 class Diffusion(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.timesteps = int(config["timesteps"])
-        self.beta_start = float(config["beta_start"])
-        self.beta_end = float(config["beta_end"])
-        self.embedding_dim = int(config["embedding_dim"])
-        self.beta_sche = config["beta_sche"]
+        self.timesteps = int(config['timesteps'])
+        self.beta_start = float(config['beta_start'])
+        self.beta_end = float(config['beta_end'])
+        self.embedding_dim = int(config['embedding_dim'])
+        self.beta_sche = config['beta_sche']
 
-        if self.beta_sche == "linear":
+        if self.beta_sche == 'linear':
             betas = linear_beta_schedule(self.timesteps, self.beta_start, self.beta_end)
-        elif self.beta_sche == "exp":
+        elif self.beta_sche == 'exp':
             betas = exp_beta_schedule(self.timesteps)
-        elif self.beta_sche == "cosine":
+        elif self.beta_sche == 'cosine':
             betas = cosine_beta_schedule(self.timesteps)
-        elif self.beta_sche == "sqrt":
+        elif self.beta_sche == 'sqrt':
             betas = betas_for_alpha_bar(self.timesteps, lambda t: 1 - np.sqrt(t + 1e-4))
         else:
             raise ValueError(f"Unknown beta_sche: {self.beta_sche}")
@@ -562,24 +448,12 @@ class Diffusion(nn.Module):
 
         # q(x_t | x_0)
         self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(self.alphas_cumprod))
-        self.register_buffer(
-            "sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - self.alphas_cumprod)
-        )
+        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - self.alphas_cumprod))
 
         # posterior q(x_{t-1} | x_t, x_0)
-        posterior_mean_coef1 = (
-            self.betas
-            * torch.sqrt(self.alphas_cumprod_prev)
-            / (1.0 - self.alphas_cumprod)
-        )
-        posterior_mean_coef2 = (
-            (1.0 - self.alphas_cumprod_prev)
-            * torch.sqrt(self.alphas)
-            / (1.0 - self.alphas_cumprod)
-        )
-        posterior_variance = (
-            self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
-        )
+        posterior_mean_coef1 = self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        posterior_mean_coef2 = (1.0 - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1.0 - self.alphas_cumprod)
+        posterior_variance = self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
 
         self.register_buffer("posterior_mean_coef1", posterior_mean_coef1)
         self.register_buffer("posterior_mean_coef2", posterior_mean_coef2)
@@ -588,18 +462,14 @@ class Diffusion(nn.Module):
         self.w_q = nn.Linear(self.embedding_dim, self.embedding_dim, bias=False)
         self.w_k = nn.Linear(self.embedding_dim, self.embedding_dim, bias=False)
         self.w_v = nn.Linear(self.embedding_dim, self.embedding_dim, bias=False)
-        init(self.w_q)
-        init(self.w_k)
-        init(self.w_v)
+        init(self.w_q); init(self.w_k); init(self.w_v)
         self.ln = nn.LayerNorm(self.embedding_dim, elementwise_affine=False)
 
     def get_timestep_embedding(self, timesteps: torch.Tensor, embedding_dim: int):
         assert len(timesteps.shape) == 1
         half_dim = embedding_dim // 2
         emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(
-            torch.arange(half_dim, dtype=torch.float32, device=timesteps.device) * -emb
-        )
+        emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=timesteps.device) * -emb)
         emb = timesteps.float()[:, None] * emb[None, :]
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
         if embedding_dim % 2 == 1:
@@ -607,15 +477,13 @@ class Diffusion(nn.Module):
         return emb
 
     def selfAttention(self, features: torch.Tensor):
-        mask = features.abs().sum(dim=-1) > 0  # [B, N]
+        mask = (features.abs().sum(dim=-1) > 0) # [B, N]
 
         features = self.ln(features)
         q = self.w_q(features)
         k = self.w_k(features)
         v = self.w_v(features)
-        attn_logits = (q * (self.embedding_dim**-0.5)) @ k.transpose(
-            -1, -2
-        )  # [B, N, N]
+        attn_logits = (q * (self.embedding_dim ** -0.5)) @ k.transpose(-1, -2)  # [B, N, N]
         attn_logits = attn_logits.masked_fill(~mask.unsqueeze(1), -1e9)
         attn = attn_logits.softmax(dim=-1)  # [B, N, N]
         out = attn @ v  # [B, N, D]
@@ -628,8 +496,8 @@ class Diffusion(nn.Module):
             noise = torch.randn_like(x_start)
         t = t.to(x_start.device)
         return (
-            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-            + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
     def p_losses(self, x_start, t, cond_src=None, cond_tgt=None, loss_type="l2"):
@@ -640,7 +508,7 @@ class Diffusion(nn.Module):
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
         t_emb = self.get_timestep_embedding(t, self.embedding_dim)  # [B, D] on device
-        tokens = torch.stack([x_noisy, t_emb, cond_src, cond_tgt], dim=1)  # [B, 4, D]
+        tokens = torch.stack([x_noisy, t_emb, cond_src, cond_tgt], dim=1) # [B, 4, D]
         predicted_x0 = self.selfAttention(tokens)
 
         if loss_type == "l2":
@@ -664,8 +532,8 @@ class Diffusion(nn.Module):
         x_start = self.selfAttention(tokens)
 
         model_mean = (
-            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start
-            + extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
+            extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
         )
 
         if t_index == 0:
@@ -676,52 +544,48 @@ class Diffusion(nn.Module):
         return model_mean + torch.sqrt(var) * noise
 
     @torch.no_grad()
-    def sample(self, x_start, cond_src, cond_tgt):
-        device = x_start.device
+    def sample_from_noise(self, cond_src, cond_tgt=None):
+        """Generate target-domain preference prototype from a Gaussian prior.
 
-        noise_x = torch.randn_like(x_start)
-        t_init = torch.full(
-            (x_start.shape[0],), self.timesteps - 1, dtype=torch.long, device=device
-        )
-        x_t = self.q_sample(x_start=x_start, t=t_init, noise=noise_x)
-
-        x_quarter = x_t
-        x_half = x_t
-        x_three_quarter = x_t
-
+        Crucially, generation does NOT require a target item or target user ID
+        embedding as x_start; it is usable for source-only cold-start users.
+        """
+        if cond_tgt is None:
+            cond_tgt = torch.zeros_like(cond_src)
+        x_t = torch.randn_like(cond_src)
         for n in reversed(range(self.timesteps)):
-            t = torch.full((x_t.shape[0],), n, dtype=torch.long, device=device)
-            x_t = self.p_sample(
-                x_t=x_t, t=t, t_index=n, cond_src=cond_src, cond_tgt=cond_tgt
-            )
+            t = torch.full((len(cond_src),), n, dtype=torch.long, device=cond_src.device)
+            x_t = self.p_sample(x_t=x_t, t=t, t_index=n,
+                                cond_src=cond_src, cond_tgt=cond_tgt)
+        return x_t
 
-            if n == int((self.timesteps - 1) * 0.75):
-                x_quarter = x_t
-            if n == int((self.timesteps - 1) * 0.5):
-                x_half = x_t
-            if n == int((self.timesteps - 1) * 0.25):
-                x_three_quarter = x_t
+    @torch.no_grad()
+    def sample(self, x_start=None, cond_src=None, cond_tgt=None):
+        """Compatibility wrapper for older callers; x_start is NOT used."""
+        if cond_src is None:
+            raise ValueError('cond_src is required')
+        result = self.sample_from_noise(cond_src, cond_tgt)
+        return x_start, result, None, None, None
 
-        return x_start, x_t, x_quarter, x_half, x_three_quarter
 
 
 class InteractionAggregator(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.aggregator = config["aggregator"]
-        self.embedding_dim = config["embedding_dim"]
-        dropout_rate = config["dropout"]
+        self.aggregator = config['aggregator']
+        self.embedding_dim = config['embedding_dim']
+        dropout_rate = config['dropout']
 
-        self.W_agg = nn.Linear(
-            config["embedding_dim"], config["embedding_dim"], bias=False
-        )
+        self.W_agg = nn.Linear(config['embedding_dim'], config['embedding_dim'], bias=False)
 
         if self.aggregator in ["user_attention"]:
             self.W_att = nn.Sequential(
-                nn.Linear(config["embedding_dim"], config["embedding_dim"]), nn.Tanh()
+                nn.Linear(config['embedding_dim'], config['embedding_dim']),
+                nn.Tanh()
             )
             self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
+
 
     def forward(self, item_emb, user_emb=None):
         """
@@ -730,7 +594,7 @@ class InteractionAggregator(nn.Module):
         return:   [B, D]
         """
         # padding mask
-        mask = item_emb.abs().sum(dim=-1) > 0  # [B, L]
+        mask = (item_emb.abs().sum(dim=-1) > 0)  # [B, L]
 
         if self.aggregator == "mean":
             denom = mask.sum(dim=1, keepdim=True).clamp(min=1)
@@ -740,9 +604,9 @@ class InteractionAggregator(nn.Module):
         elif self.aggregator == "user_attention":
             assert user_emb is not None
 
-            key = self.W_att(item_emb)  # [B, L, D]
-            att = torch.bmm(key, user_emb.unsqueeze(-1))  # [B, L, 1]
-            att = att.squeeze(-1)  # [B, L]
+            key = self.W_att(item_emb)                     # [B, L, D]
+            att = torch.bmm(key, user_emb.unsqueeze(-1))   # [B, L, 1]
+            att = att.squeeze(-1)                          # [B, L]
             att = att.masked_fill(~mask, -1e9)
             att = torch.softmax(att, dim=1)
 
@@ -756,8 +620,9 @@ class InteractionAggregator(nn.Module):
             raise ValueError(f"Unknown aggregator: {self.aggregator}")
 
 
+
+
 def _extract_item_profile(meta: dict) -> dict:
-    """Implementation details."""
 
     if meta is None:
         return {
@@ -774,9 +639,7 @@ def _extract_item_profile(meta: dict) -> dict:
 
     # description
     description = meta.get("description")
-    description = (
-        description if isinstance(description, str) and description.strip() else "None"
-    )
+    description = description if isinstance(description, str) and description.strip() else "None"
 
     # categories (flatten + deduplicate)
     raw_categories = meta.get("categories")
@@ -799,16 +662,15 @@ def _extract_item_profile(meta: dict) -> dict:
     brand = brand if isinstance(brand, str) and brand.strip() else "None"
 
     return {
-        "title": title,
-        "description": description,
-        "categories": categories,
-        "price": price,
-        "brand": brand,
+        "title": title, 
+        "description": description, 
+        "categories": categories, 
+        "price": price, 
+        "brand": brand, 
     }
 
 
 def _normalize_review(review):
-    """Implementation details."""
 
     if isinstance(review, str) and review.strip():
         return review
@@ -886,9 +748,9 @@ def _user_domain_items_to_string(user_profile):
 
         fields = []
         for k in ordered_keys:
-            v = item[k]
-            v_escaped = v.replace("\\", "\\\\").replace('"', '\\"')
-            fields.append(f'"{k}": "{v_escaped}"')
+            v = item[k]  #
+            v_escaped = v.replace("\\", "\\\\").replace("\"", "\\\"")
+            fields.append(f"\"{k}\": \"{v_escaped}\"")
 
         item_str = "{ " + ", ".join(fields) + " }"
         lines.append(item_str)
@@ -927,9 +789,9 @@ def _build_user_prompt_string(user_profile_string: dict) -> str:
         prompt_str (str)
     """
     return (
-        "INTERACTIONS FROM CLOTHING, SHOES AND JEWELRY:\n"
+        "INTERACTIONS FROM ELECTRONICS:\n"
         f"{user_profile_string['src']}\n\n"
-        "INTERACTIONS FROM SPORTS AND OUTDOORS:\n"
+        "INTERACTIONS FROM PHONES:\n"
         f"{user_profile_string['tgt']}"
     )
 
@@ -970,11 +832,7 @@ def _extract_string_list(text: str):
     # fast path: JSON list
     try:
         obj = json.loads(text)
-        if (
-            isinstance(obj, list)
-            and len(obj) > 0
-            and all(isinstance(x, str) for x in obj)
-        ):
+        if isinstance(obj, list) and len(obj) > 0 and all(isinstance(x, str) for x in obj):
             return obj
     except Exception:
         pass
@@ -982,13 +840,8 @@ def _extract_string_list(text: str):
     # fallback: Python literal list
     try:
         import ast
-
         obj = ast.literal_eval(text)
-        if (
-            isinstance(obj, list)
-            and len(obj) > 0
-            and all(isinstance(x, str) for x in obj)
-        ):
+        if isinstance(obj, list) and len(obj) > 0 and all(isinstance(x, str) for x in obj):
             return obj
     except Exception:
         pass
@@ -1004,7 +857,6 @@ def _process_single_user(args):
     user_id, prompt, system_prompt, max_retry = args
 
     from openai import OpenAI
-
     client = OpenAI()
 
     last_response_text = None
@@ -1045,6 +897,7 @@ def _process_single_user(args):
     }
 
 
+
 def _run_user_summarization_multiprocess(
     user_prompts: dict,
     system_prompt: str,
@@ -1076,34 +929,18 @@ def _run_user_summarization_multiprocess(
     return results, error_users
 
 
-def _configure_openai_environment(config):
-    api_key = config.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("Set OPENAI_API_KEY before generating semantic embeddings.")
-
-    base_url = config.get("openai_base_url") or os.environ.get("OPENAI_BASE_URL")
-    os.environ["OPENAI_API_KEY"] = api_key
-    if base_url:
-        os.environ["OPENAI_BASE_URL"] = base_url
-    return api_key, base_url
-
-
-def extract_CrossDomain_semantics_both_tag_modality_data(
-    config, modality, interaction, id_mapping, raw_data_list
-):
-    if config["dataset"] == "Amazon2014":
+def extract_CrossDomain_semantics_both_tag_modality_data(config, modality, interaction, id_mapping, raw_data_list):
+    if config['dataset'] == "Amazon2014":
         reviews, metadata = raw_data_list
-    elif config["dataset"] == "Douban":
+    elif config['dataset'] == "Douban":
         reviews = raw_data_list[0]
         metadata = raw_data_list[2]
-    else:
-        raise ValueError(f'Unsupported dataset: {config["dataset"]}')
 
     """
     Step 1:
     Collect per-user cross-domain item profiles + reviews.
     """
-
+  
     user_item_profiles = {}
 
     _collect_domain_user_items(
@@ -1123,6 +960,7 @@ def extract_CrossDomain_semantics_both_tag_modality_data(
         user_item_dict=user_item_profiles,
     )
 
+    
     item_profiles_src = {}
     item_profiles_tgt = {}
 
@@ -1140,47 +978,46 @@ def extract_CrossDomain_semantics_both_tag_modality_data(
         item_profile_dict=item_profiles_tgt,
     )
 
-    profile_users = set(user_item_profiles.keys())
-    src_users = set(id_mapping["src"]["id2user"][1:])
-    tgt_users = set(id_mapping["tgt"]["id2user"][1:])
-    profile_src_users = {u for u, v in user_item_profiles.items() if len(v["src"]) > 0}
-    profile_tgt_users = {u for u, v in user_item_profiles.items() if len(v["tgt"]) > 0}
-    mapping_overlap_users = src_users & tgt_users
+  
+    profile_users = set(user_item_profiles.keys()) 
+    src_users = set(id_mapping["src"]["id2user"][1:])  
+    tgt_users = set(id_mapping["tgt"]["id2user"][1:])  
+    profile_src_users = {u for u, v in user_item_profiles.items() if len(v["src"]) > 0} 
+    profile_tgt_users = {u for u, v in user_item_profiles.items() if len(v["tgt"]) > 0} 
+    mapping_overlap_users = src_users & tgt_users 
     profile_overlap_users = profile_src_users & profile_tgt_users
-    assert profile_users.issubset(
-        src_users | tgt_users
-    ), "user_item_profiles contains users not in src or tgt id_mapping"
-    assert (
-        profile_src_users == src_users
-    ), f"Mismatch in src users: profile={len(profile_src_users)}, mapping={len(src_users)}"
-    assert (
-        profile_tgt_users == tgt_users
-    ), f"Mismatch in tgt users: profile={len(profile_tgt_users)}, mapping={len(tgt_users)}"
-    assert (
-        profile_overlap_users == mapping_overlap_users
-    ), f"Mismatch in overlap users: profile={len(profile_overlap_users)}, mapping={len(mapping_overlap_users)}"
+    assert profile_users.issubset(src_users | tgt_users), \
+        "user_item_profiles contains users not in src or tgt id_mapping"
+    assert profile_src_users == src_users, \
+        f"Mismatch in src users: profile={len(profile_src_users)}, mapping={len(src_users)}"
+    assert profile_tgt_users == tgt_users, \
+        f"Mismatch in tgt users: profile={len(profile_tgt_users)}, mapping={len(tgt_users)}"
+    assert profile_overlap_users == mapping_overlap_users, \
+        f"Mismatch in overlap users: profile={len(profile_overlap_users)}, mapping={len(mapping_overlap_users)}"
 
+    
     src_items = set(id_mapping["src"]["id2item"][1:])
     tgt_items = set(id_mapping["tgt"]["id2item"][1:])
     profile_src_items = set(item_profiles_src.keys())
     profile_tgt_items = set(item_profiles_tgt.keys())
-    assert (
-        profile_src_items == src_items
-    ), f"Mismatch in src items: profile={len(profile_src_items)}, mapping={len(src_items)}"
-    assert (
-        profile_tgt_items == tgt_items
-    ), f"Mismatch in tgt items: profile={len(profile_tgt_items)}, mapping={len(tgt_items)}"
+    assert profile_src_items == src_items, \
+        f"Mismatch in src items: profile={len(profile_src_items)}, mapping={len(src_items)}"
+    assert profile_tgt_items == tgt_items, \
+        f"Mismatch in tgt items: profile={len(profile_tgt_items)}, mapping={len(tgt_items)}"
 
+    
     user_profile_strings = {
         user_id: _user_item_profile_to_string(profile)
         for user_id, profile in user_item_profiles.items()
     }
 
+    
     item_prompts_src = {
         item_id: _build_item_prompt_string(profile)
         for item_id, profile in item_profiles_src.items()
     }
 
+    
     item_prompts_tgt = {
         item_id: _build_item_prompt_string(profile)
         for item_id, profile in item_profiles_tgt.items()
@@ -1192,8 +1029,11 @@ def extract_CrossDomain_semantics_both_tag_modality_data(
     Step 2:
     call LLM to summarize users (multiprocess).
     """
-    _configure_openai_environment(config)
+    import os
+    os.environ["OPENAI_API_KEY"] = config["openai_api_key"]
+    os.environ["OPENAI_BASE_URL"] = config['openai_base_url']
 
+    
     results, error_users = _run_user_summarization_multiprocess(
         user_prompts=user_prompts,
         system_prompt=CROSSDOMAIN_USER_SYSTEM_PROMPT,
@@ -1201,6 +1041,7 @@ def extract_CrossDomain_semantics_both_tag_modality_data(
         num_workers=20,
     )
 
+    
     data_items_src, error_items_src = _run_user_summarization_multiprocess(
         user_prompts=item_prompts_src,
         system_prompt=SRC_ITEM_SYSTEM_PROMPT,
@@ -1208,6 +1049,7 @@ def extract_CrossDomain_semantics_both_tag_modality_data(
         num_workers=20,
     )
 
+   
     data_items_tgt, error_items_tgt = _run_user_summarization_multiprocess(
         user_prompts=item_prompts_tgt,
         system_prompt=TGT_ITEM_SYSTEM_PROMPT,
@@ -1285,6 +1127,7 @@ def generate_CrossDomain_semantics_both_tag_embs(
     ordered_raw_users = []
     ordered_tag_lists = []  # List[List[str]]
 
+
     # (1) overlap users
     for uid in range(1, num_overlap_user + 1):
         raw_user = src_id2user[uid]
@@ -1340,8 +1183,8 @@ def generate_CrossDomain_semantics_both_tag_embs(
     # Step 3: batch encode summaries
     # =========================================================
     # user
-    flat_texts = []
-    flat_user_idx = []
+    flat_texts = []  
+    flat_user_idx = []  
     for user_idx, tag_list in enumerate(ordered_tag_lists):
         for tag in tag_list:
             flat_texts.append(tag)
@@ -1362,6 +1205,7 @@ def generate_CrossDomain_semantics_both_tag_embs(
             flat_item_texts.append(tag)
             flat_item_idx.append(src_item_offset + item_idx)
 
+    
     all_flat_texts = flat_texts + flat_item_texts
     num_flat = len(all_flat_texts)
     if num_flat == 0:
@@ -1369,12 +1213,12 @@ def generate_CrossDomain_semantics_both_tag_embs(
 
     num_users = len(ordered_raw_users)
     num_items_total = len(ordered_src_items) + len(ordered_tgt_items)
-
+    
     sum_user_embs = None
     cnt_user = np.zeros((num_users,), dtype=np.int32)
     sum_item_embs = None
     cnt_item = np.zeros((num_items_total,), dtype=np.int32)
-    num_user_tags = len(flat_texts)
+    num_user_tags = len(flat_texts)  
 
     # if 'text-embedding-3' in modality['emb_model']:
     #     from openai import OpenAI
@@ -1401,14 +1245,13 @@ def generate_CrossDomain_semantics_both_tag_embs(
     #             flat_embs.append(emb)
     #
     #     flat_embs = np.stack(flat_embs, axis=0)  # [num_tags, D]
-    if "text-embedding-3" in modality["emb_model"]:
+    if 'text-embedding-3' in modality['emb_model']:
         from openai import OpenAI
 
-        api_key, base_url = _configure_openai_environment(config)
-        client_kwargs = {"api_key": api_key}
-        if base_url:
-            client_kwargs["base_url"] = base_url
-        client = OpenAI(**client_kwargs)
+        client = OpenAI(
+            api_key=config["openai_api_key"],
+            base_url=config.get("openai_base_url", None),
+        )
 
         for start in range(0, num_flat, batch_size):
             end = min(start + batch_size, num_flat)
@@ -1419,34 +1262,36 @@ def generate_CrossDomain_semantics_both_tag_embs(
                 input=batch_texts,
             )
 
+           
             for j, emb_obj in enumerate(response.data):
                 emb = np.asarray(emb_obj.embedding, dtype=np.float32)
 
                 if normalize:
                     emb = emb / (np.linalg.norm(emb) + 1e-12)
 
+                
                 if sum_user_embs is None:
                     emb_dim = emb.shape[0]
                     sum_user_embs = np.zeros((num_users, emb_dim), dtype=np.float32)
-                    sum_item_embs = np.zeros(
-                        (num_items_total, emb_dim), dtype=np.float32
-                    )
+                    sum_item_embs = np.zeros((num_items_total, emb_dim), dtype=np.float32)
 
-                global_idx = start + j
+                global_idx = start + j  
 
+                # 0 .. num_user_tags-1 是 user tags
                 if global_idx < num_user_tags:
                     uidx = flat_user_idx[global_idx]
                     sum_user_embs[uidx] += emb
                     cnt_user[uidx] += 1
                 else:
-
+                    
                     k = global_idx - num_user_tags
-                    iidx = flat_item_idx[k]
+                    iidx = flat_item_idx[k]  
                     sum_item_embs[iidx] += emb
                     cnt_item[iidx] += 1
     else:
         raise NotImplementedError("Only OpenAI embedding models are handled here.")
 
+   
     # emb_dim = flat_embs.shape[1]
     # num_users = len(ordered_raw_users)
     # num_user_tags = len(flat_texts)
@@ -1487,6 +1332,7 @@ def generate_CrossDomain_semantics_both_tag_embs(
     if sum_user_embs is None:
         raise ValueError("Embedding failed: sum_user_embs was not initialized.")
 
+   
     cnt_user_safe = np.clip(cnt_user, 1, None).astype(np.float32)
     cnt_item_safe = np.clip(cnt_item, 1, None).astype(np.float32)
 
@@ -1504,8 +1350,8 @@ def generate_CrossDomain_semantics_both_tag_embs(
     final_embeddings = np.concatenate(
         [
             user_embeddings,
-            item_embs[: len(ordered_src_items)],  # src items
-            item_embs[len(ordered_src_items) :],  # tgt items
+            item_embs[:len(ordered_src_items)],  # src items
+            item_embs[len(ordered_src_items):],  # tgt items
         ],
         axis=0,
     )
@@ -1513,9 +1359,8 @@ def generate_CrossDomain_semantics_both_tag_embs(
     return final_embeddings
 
 
-def generate_CrossDomain_semantics_both_tag_final_embs(
-    config, modality, interaction, id_mapping, modality_embs
-):
+
+def generate_CrossDomain_semantics_both_tag_final_embs(config, modality, interaction, id_mapping, modality_embs):
     input_dim = modality_embs.shape[1]
     target_dim = modality["emb_pca"]
 
@@ -1523,7 +1368,6 @@ def generate_CrossDomain_semantics_both_tag_final_embs(
         return modality_embs.astype(np.float32)
 
     from sklearn.decomposition import PCA
-
     pca = PCA(
         n_components=target_dim,
         random_state=config.get("seed", 999),
@@ -1537,15 +1381,16 @@ def generate_CrossDomain_semantics_both_tag_final_embs(
     return final_embs.astype(np.float32)
 
 
+
 CROSSDOMAIN_USER_SYSTEM_PROMPT = """
 You are an expert in recommendation systems.
 Your task is to summarize a user's interests based on their interactions with items from two different types of product categories.
-The source category is clothing, shoes, and jewelry.
-The target category is sports and outdoors.
+One category is about electronics.
+The other category is about cell phones and accessories.
 
 The information I will give you:
-INTERACTIONS FROM CLOTHING, SHOES AND JEWELRY: A LIST of user interactions with items related to clothing, shoes, and jewelry.
-INTERACTIONS FROM SPORTS AND OUTDOORS: A LIST of user interactions with items related to sports and outdoors.
+INTERACTIONS FROM ELECTRONICS: A LIST of user interactions with items related to electronics.
+INTERACTIONS FROM PHONES: A LIST of user interactions with items related to cell phones and accessories.
 
 Each interaction is described in JSON format with the following attributes, where missing values are set to "None".
 The attributes include the item's information and the user's review on that item:
@@ -1574,15 +1419,16 @@ Requirements:
    - usage scenarios,
    or any concrete physical objects.
 2. Output only a list of tags, following this structure: ["tag1", "tag2", "tag3", "..."]
-    - tags must be: typically 1-2 words (at most 3)
+    - tags must be: typically 1–2 words (at most 3)
     - the number of tags should be 2-4
 3. Do not provide any other text outside the list.
 """
 
 
+
 SRC_ITEM_SYSTEM_PROMPT = """
 You are an expert in recommendation systems.
-Your task is to analyze ONE product item related to clothing, shoes, and jewelry,
+Your task is to analyze ONE product item related to electronics,
 and summarize what types of users this item is likely to attract.
 
 The information I will give you is the item's metadata in JSON format,
@@ -1609,15 +1455,16 @@ Requirements:
    - item categories,
    - concrete usage scenarios.
 2. Output ONLY a list of tags, following this format: ["tag1", "tag2", "tag3", "..."]
-   - tags must be: typically 1-2 words (at most 3)
-   - the number of tags should be 2-4
+   - tags must be: typically 1–2 words (at most 3)
+   - the number of tags should be 2–4
 3. Do not provide any other text outside the list.
 """
 
 
+
 TGT_ITEM_SYSTEM_PROMPT = """
 You are an expert in recommendation systems.
-Your task is to analyze ONE product item related to sports and outdoors,
+Your task is to analyze ONE product item related to cell phones and accessories,
 and summarize what types of users this item is likely to attract.
 
 The information I will give you is the item's metadata in JSON format,
@@ -1644,7 +1491,11 @@ Requirements:
    - item categories,
    - concrete usage scenarios.
 2. Output ONLY a list of tags, following this format: ["tag1", "tag2", "tag3", "..."]
-   - tags must be: typically 1-2 words (at most 3)
-   - the number of tags should be 2-4
+   - tags must be: typically 1–2 words (at most 3)
+   - the number of tags should be 2–4
 3. Do not provide any other text outside the list.
 """
+
+
+
+
